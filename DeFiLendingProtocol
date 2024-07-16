@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "./IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract DeFiLendingProtocol is Ownable {
+    using SafeMath for uint256;
+
+    // Token used as collateral
+    IERC20 public collateralToken;
+
+    // Token being lent/borrowed
+    IERC20 public loanToken;
+
+    // Interest rate parameters
+    uint256 public baseRatePerYear;
+    uint256 public multiplierPerYear;
+    uint256 public jumpMultiplierPerYear;
+    uint256 public kink;
+
+    // Account information
+    struct Account {
+        uint256 supplyPrincipal;    // Principal supplied
+        uint256 borrowPrincipal;    // Principal borrowed
+        uint256 supplyIndex;        // Principal supply index
+        uint256 borrowIndex;        // Principal borrow index
+        uint256 borrowInterestIndex;// Interest index for borrow
+    }
+
+    // User accounts
+    mapping(address => Account) public accounts;
+
+    // Global accounting state
+    uint256 public totalSupply;
+    uint256 public totalBorrows;
+    uint256 public totalReserves;
+
+    // Events
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event Borrow(address indexed user, uint256 amount);
+    event Repay(address indexed user, uint256 amount);
+    event Liquidate(address indexed borrower, address indexed liquidator, uint256 amount);
+
+    constructor(address _collateralToken, address _loanToken, uint256 _baseRatePerYear, uint256 _multiplierPerYear, uint256 _jumpMultiplierPerYear, uint256 _kink) {
+        collateralToken = IERC20(_collateralToken);
+        loanToken = IERC20(_loanToken);
+        baseRatePerYear = _baseRatePerYear;
+        multiplierPerYear = _multiplierPerYear;
+        jumpMultiplierPerYear = _jumpMultiplierPerYear;
+        kink = _kink;
+    }
+
+    // Deposit collateral tokens
+    function deposit(uint256 amount) external {
+        require(amount > 0, "Amount must be greater than 0");
+        require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+
+        Account storage account = accounts[msg.sender];
+        account.supplyPrincipal = account.supplyPrincipal.add(amount);
+        account.supplyIndex = calculateSupplyIndex(account.supplyPrincipal, account.supplyIndex);
+
+        totalSupply = totalSupply.add(amount);
+        emit Deposit(msg.sender, amount);
+    }
+
+    // Withdraw collateral tokens
+    function withdraw(uint256 amount) external {
+        require(amount > 0, "Amount must be greater than 0");
+
+        Account storage account = accounts[msg.sender];
+        require(account.supplyPrincipal >= amount, "Insufficient supply balance");
+
+        account.supplyPrincipal = account.supplyPrincipal.sub(amount);
+        account.supplyIndex = calculateSupplyIndex(account.supplyPrincipal, account.supplyIndex);
+
+        totalSupply = totalSupply.sub(amount);
+        require(collateralToken.transfer(msg.sender, amount), "Transfer failed");
+
+        emit Withdraw(msg.sender, amount);
+    }
+
+    // Borrow tokens against collateral
+    function borrow(uint256 amount) external {
+        require(amount > 0, "Amount must be greater than 0");
+
+        Account storage account = accounts[msg.sender];
+        require(account.borrowPrincipal == 0, "Already borrowed");
+        
+        uint256 borrowAmountWithFee = amount.mul(105).div(100); // 5% borrowing fee
+        require(loanToken.balanceOf(address(this)) >= borrowAmountWithFee, "Insufficient liquidity");
+
+        account.borrowPrincipal = amount;
+        account.borrowIndex = calculateBorrowIndex(account.borrowPrincipal, account.borrowIndex);
+        account.borrowInterestIndex = borrowIndex();
+
+        totalBorrows = totalBorrows.add(amount);
+        loanToken.transfer(msg.sender, amount);
+
+        emit Borrow(msg.sender, amount);
+    }
+
+    // Repay borrowed tokens
+    function repay(uint256 amount) external {
+        require(amount > 0, "Amount must be greater than 0");
+
+        Account storage account = accounts[msg.sender];
+        require(account.borrowPrincipal > 0, "No active borrow");
+
+        account.borrowPrincipal = account.borrowPrincipal.sub(amount);
+        account.borrowIndex = calculateBorrowIndex(account.borrowPrincipal, account.borrowIndex);
+        totalBorrows = totalBorrows.sub(amount);
+
+        loanToken.transferFrom(msg.sender, address(this), amount);
+
+        emit Repay(msg.sender, amount);
+    }
+
+    // Liquidate borrower's collateral in case of undercollateralization
+    function liquidate(address borrower, uint256 amount) external onlyOwner {
+        Account storage account = accounts[borrower];
+        require(account.borrowPrincipal > 0, "No active borrow");
+        require(collateralToken.balanceOf(address(this)) >= amount, "Insufficient collateral");
+
+        // Calculate amount to liquidate based on loan token value
+        uint256 collateralValue = amount.mul(loanToken.balanceOf(address(this))).div(totalBorrows);
+        require(collateralToken.transfer(msg.sender, collateralValue), "Transfer failed");
+
+        account.borrowPrincipal = 0;
+        account.borrowIndex = 0;
+        totalBorrows = totalBorrows.sub(account.borrowPrincipal);
+
+        emit Liquidate(borrower, msg.sender, amount);
+    }
+
+    // Internal function to calculate supply index
+    function calculateSupplyIndex(uint256 principal, uint256 currentIndex) internal view returns (uint256) {
+        if (totalSupply == 0) {
+            return 1e18; // Initial index
+        } else {
+            return currentIndex.mul(totalSupply).add(principal.mul(1e18)).div(totalSupply.add(principal));
+        }
+    }
+
+    // Internal function to calculate borrow index
+    function calculateBorrowIndex(uint256 principal, uint256 currentIndex) internal view returns (uint256) {
+        if (totalBorrows == 0) {
+            return 1e18; // Initial index
+        } else {
+            return currentIndex.mul(totalBorrows).add(principal.mul(1e18)).div(totalBorrows.add(principal));
+        }
+    }
+
+    // Internal function to calculate borrow index
+    function borrowIndex() internal view returns (uint256) {
+        return block.timestamp;
+    }
+
+    // Owner function to withdraw any remaining tokens
+    function withdrawToken(address token, uint256 amount) external onlyOwner {
+        require(IERC20(token).transfer(owner(), amount), "Transfer failed");
+    }
+
+    // View function to get account information
+    function getAccount(address user) external view returns (uint256, uint256, uint256, uint256, uint256) {
+        Account storage account = accounts[user];
+        return (
+            account.supplyPrincipal,
+            account.borrowPrincipal,
+            account.supplyIndex,
+            account.borrowIndex,
+            account.borrowInterestIndex
+        );
+    }
+}
